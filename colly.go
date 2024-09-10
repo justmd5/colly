@@ -233,6 +233,8 @@ var (
 	ErrQueueFull = errors.New("Queue MaxSize reached")
 	// ErrMaxRequests is the error returned when exceeding max requests
 	ErrMaxRequests = errors.New("Max Requests limit reached")
+	// ErrRetryBodyUnseekable is the error when retry with not seekable body
+	ErrRetryBodyUnseekable = errors.New("Retry Body Unseekable")
 )
 
 var envMap = map[string]func(*Collector, string){
@@ -629,6 +631,13 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 	if _, ok := hdr["User-Agent"]; !ok {
 		hdr.Set("User-Agent", c.UserAgent)
 	}
+	if seeker, ok := requestData.(io.ReadSeeker); ok {
+		_, err := seeker.Seek(0, io.SeekStart)
+		if err != nil {
+			return err
+		}
+	}
+
 	req, err := http.NewRequest(method, parsedURL.String(), requestData)
 	if err != nil {
 		return err
@@ -671,6 +680,10 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		ID:        atomic.AddUint32(&c.requestCount, 1),
 	}
 
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "*/*")
+	}
+
 	c.handleOnRequest(request)
 
 	if request.abort {
@@ -679,10 +692,6 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 
 	if method == "POST" && req.Header.Get("Content-Type") == "" {
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-	}
-
-	if req.Header.Get("Accept") == "" {
-		req.Header.Set("Accept", "*/*")
 	}
 
 	var hTrace *HTTPTrace
@@ -1108,9 +1117,27 @@ func (c *Collector) handleOnResponseHeaders(r *Response) {
 }
 
 func (c *Collector) handleOnHTML(resp *Response) error {
-	if len(c.htmlCallbacks) == 0 || !strings.Contains(strings.ToLower(resp.Headers.Get("Content-Type")), "html") {
+	if len(c.htmlCallbacks) == 0 {
 		return nil
 	}
+
+	contentType := resp.Headers.Get("Content-Type")
+	if contentType == "" {
+		contentType = http.DetectContentType(resp.Body)
+	}
+	// implementation of mime.ParseMediaType without parsing the params
+	// part
+	mediatype, _, _ := strings.Cut(contentType, ";")
+	mediatype = strings.TrimSpace(strings.ToLower(mediatype))
+
+	// TODO we also want to parse application/xml as XHTML if it has
+	// appropriate doctype
+	switch mediatype {
+	case "text/html", "application/xhtml+xml":
+	default:
+		return nil
+	}
+
 	doc, err := goquery.NewDocumentFromReader(bytes.NewBuffer(resp.Body))
 	if err != nil {
 		return err
@@ -1440,7 +1467,8 @@ func createMultipartReader(boundary string, data map[string][]byte) io.Reader {
 		buffer.WriteString("\n")
 	}
 	buffer.WriteString(dashBoundary + "--\n\n")
-	return buffer
+	return bytes.NewReader(buffer.Bytes())
+
 }
 
 // randomBoundary was borrowed from

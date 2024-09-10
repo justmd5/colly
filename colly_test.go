@@ -52,7 +52,11 @@ func newUnstartedTestServer() *httptest.Server {
 	})
 
 	mux.HandleFunc("/html", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
+		if r.URL.Query().Get("no-content-type") != "" {
+			w.Header()["Content-Type"] = nil
+		} else {
+			w.Header().Set("Content-Type", "text/html")
+		}
 		w.Write([]byte(`<!DOCTYPE html>
 <html>
 <head>
@@ -145,6 +149,11 @@ func newUnstartedTestServer() *httptest.Server {
 	mux.HandleFunc("/host_header", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		w.Write([]byte(r.Host))
+	})
+
+	mux.HandleFunc("/accept_header", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(r.Header.Get("Accept")))
 	})
 
 	mux.HandleFunc("/custom_header", func(w http.ResponseWriter, r *http.Request) {
@@ -424,6 +433,39 @@ var newCollectorTests = map[string]func(*testing.T){
 	},
 }
 
+func TestNoAcceptHeader(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	var receivedHeader string
+	// checks if Accept is enabled by default
+	func() {
+		c := NewCollector()
+		c.OnResponse(func(resp *Response) {
+			receivedHeader = string(resp.Body)
+		})
+		c.Visit(ts.URL + "/accept_header")
+		if receivedHeader != "*/*" {
+			t.Errorf("default Accept header isn't */*. got: %v", receivedHeader)
+		}
+	}()
+
+	// checks if Accept can be disabled
+	func() {
+		c := NewCollector()
+		c.OnRequest(func(r *Request) {
+			r.Headers.Del("Accept")
+		})
+		c.OnResponse(func(resp *Response) {
+			receivedHeader = string(resp.Body)
+		})
+		c.Visit(ts.URL + "/accept_header")
+		if receivedHeader != "" {
+			t.Errorf("failed to pass request with no Accept header. got: %v", receivedHeader)
+		}
+	}()
+}
+
 func TestNewCollector(t *testing.T) {
 	t.Run("Functional Options", func(t *testing.T) {
 		for name, test := range newCollectorTests {
@@ -586,6 +628,34 @@ func TestCollectorOnHTML(t *testing.T) {
 
 	if paragraphCallbackCount != 2 {
 		t.Error("Failed to find all <p> tags")
+	}
+}
+
+func TestCollectorContentSniffing(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	c := NewCollector()
+
+	htmlCallbackCalled := false
+
+	c.OnResponse(func(r *Response) {
+		if (*r.Headers)["Content-Type"] != nil {
+			t.Error("Content-Type unexpectedly not nil")
+		}
+	})
+
+	c.OnHTML("html", func(e *HTMLElement) {
+		htmlCallbackCalled = true
+	})
+
+	err := c.Visit(ts.URL + "/html?no-content-type=yes")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !htmlCallbackCalled {
+		t.Error("OnHTML was not called")
 	}
 }
 
@@ -916,6 +986,19 @@ func TestRedirect(t *testing.T) {
 		}
 	})
 	c.Visit(ts.URL + "/redirect")
+}
+
+func TestIssue594(t *testing.T) {
+	// This is a regression test for a data race bug. There's no
+	// assertions because it's meant to be used with race detector
+	ts := newTestServer()
+	defer ts.Close()
+
+	c := NewCollector()
+	// if timeout is set, this bug is not triggered
+	c.SetClient(&http.Client{Timeout: 0 * time.Second})
+
+	c.Visit(ts.URL)
 }
 
 func TestRedirectWithDisallowedURLs(t *testing.T) {
@@ -1651,4 +1734,83 @@ func requireSessionCookieAuthPage(handler http.Handler) http.Handler {
 		}
 		handler.ServeHTTP(w, r)
 	})
+}
+
+func TestCollectorPostRetry(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	postValue := "hello"
+	c := NewCollector()
+	try := false
+	c.OnResponse(func(r *Response) {
+		if r.Ctx.Get("notFirst") == "" {
+			r.Ctx.Put("notFirst", "first")
+			_ = r.Request.Retry()
+			return
+		}
+		if postValue != string(r.Body) {
+			t.Error("Failed to send data with POST")
+		}
+		try = true
+	})
+
+	c.Post(ts.URL+"/login", map[string]string{
+		"name": postValue,
+	})
+	if !try {
+		t.Error("OnResponse Retry was not called")
+	}
+}
+func TestCollectorGetRetry(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+	try := false
+
+	c := NewCollector()
+
+	c.OnResponse(func(r *Response) {
+		if r.Ctx.Get("notFirst") == "" {
+			r.Ctx.Put("notFirst", "first")
+			_ = r.Request.Retry()
+			return
+		}
+		if !bytes.Equal(r.Body, serverIndexResponse) {
+			t.Error("Response body does not match with the original content")
+		}
+		try = true
+	})
+
+	c.Visit(ts.URL)
+	if !try {
+		t.Error("OnResponse Retry was not called")
+	}
+}
+
+func TestCollectorPostRetryUnseekable(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+	try := false
+	postValue := "hello"
+	c := NewCollector()
+
+	c.OnResponse(func(r *Response) {
+		if postValue != string(r.Body) {
+			t.Error("Failed to send data with POST")
+		}
+
+		if r.Ctx.Get("notFirst") == "" {
+			r.Ctx.Put("notFirst", "first")
+			err := r.Request.Retry()
+			if !errors.Is(err, ErrRetryBodyUnseekable) {
+				t.Errorf("Unexpected error Type ErrRetryBodyUnseekable : %v", err)
+			}
+			return
+		}
+		try = true
+	})
+	c.Request("POST", ts.URL+"/login", bytes.NewBuffer([]byte("name="+postValue)), nil, nil)
+	if try {
+		t.Error("OnResponse Retry was called but BodyUnseekable")
+	}
 }
